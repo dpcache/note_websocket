@@ -1,50 +1,89 @@
-import 'dotenv/config'; // automatically loads .env
+import 'dotenv/config';
 import WebSocket, { WebSocketServer } from 'ws';
 import { Client } from 'pg';
 
-const PORT = 3001;
-const wss = new WebSocketServer({ port: PORT });
+// ---- SETTINGS TO REDUCE BANDWIDTH ----
+const MAX_CLIENTS_PER_IP = 20;         // Limit open WS connections per IP
+const MAX_MSGS_PER_MIN = 100;          // Throttle broadcast rate (per client)
+const HEARTBEAT_INTERVAL = 20000;     // 20s ping to close dead clients
+const MAX_CONNECTION_DURATION = 30 * 60 * 1000; // Auto-close after 1 hour
+
+const port = parseInt(process.env.PORT || "3001");
+const wss = new WebSocketServer({ port });
+
+// Track rate-limit and IP usage
+const ipConnectionCount = new Map<string, number>();
+const clientMessageCount = new Map<WebSocket, number>();
 
 // PostgreSQL client
 const pgClient = new Client({
-  connectionString: process.env.DATABASE_URL, 
+  connectionString: process.env.DATABASE_URL,
 });
 
 async function startPostgresListener() {
   await pgClient.connect();
+  await pgClient.query("LISTEN note_changes");
 
-  // Listen to the "note_changes" channel
-  await pgClient.query('LISTEN note_changes');
+  pgClient.on("notification", (msg) => {
+    if (!msg.payload) return;
 
-  pgClient.on('notification', (msg) => {
-    if (msg.channel === 'note_changes' && msg.payload) {
-      const payload = msg.payload; // Guaranteed string
-      console.log('Postgres notification:', payload);
+    const payload = msg.payload;
 
-      // Broadcast to all WebSocket clients
-      wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(payload); // safe
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        const count = clientMessageCount.get(client) ?? 0;
+
+        // Throttle egress to control cost
+        if (count < MAX_MSGS_PER_MIN) {
+          client.send(payload);
+          clientMessageCount.set(client, count + 1);
         }
-      });
-    }
+      }
+    });
   });
 
-  console.log('Listening for Postgres notifications on "note_changes"');
+  console.log('Postgres notifications on "note_changes" listening…');
 }
+
+// Reset per-minute throttles
+setInterval(() => {
+  clientMessageCount.clear();
+}, 60 * 1000);
 
 startPostgresListener().catch(console.error);
 
 // WebSocket connections
-wss.on('connection', (ws: WebSocket) => {
-  console.log('Client connected');
+wss.on("connection", (ws, req) => {
+  const ip = req.socket.remoteAddress ?? "unknown";
 
-  ws.on('message', (message: WebSocket.RawData) => {
-    const msg = message.toString();
-    console.log(`Received from client: ${msg}`);
+  // Count connections per IP to prevent abuse & reduce egress
+  const existing = ipConnectionCount.get(ip) || 0;
+  if (existing >= MAX_CLIENTS_PER_IP) {
+    ws.close(4001, "Too many connections from same IP");
+    return;
+  }
+  ipConnectionCount.set(ip, existing + 1);
+
+  console.log(`Client connected (${ip})`);
+
+  // Heartbeat to clear dead connections
+  const interval = setInterval(() => {
+    if (ws.readyState !== WebSocket.OPEN) {
+      clearInterval(interval);
+      return;
+    }
+    ws.ping();
+  }, HEARTBEAT_INTERVAL);
+
+  // Auto-close to prevent infinite idle connections
+  const autoClose = setTimeout(() => ws.close(4002, "Max duration reached"), MAX_CONNECTION_DURATION);
+
+  ws.on("close", () => {
+    clearInterval(interval);
+    clearTimeout(autoClose);
+    ipConnectionCount.set(ip, Math.max(0, (ipConnectionCount.get(ip) || 1) - 1));
+    console.log(`Client disconnected (${ip})`);
   });
-
-  ws.on('close', () => console.log('Client disconnected'));
 });
 
-console.log(`WebSocket server running on ws://localhost:${PORT}`);
+console.log(`WebSocket running on ws://0.0.0.0:${port}`);
